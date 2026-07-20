@@ -1,0 +1,166 @@
+name: Publish selected variants to GHCR
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: "Comma-separated variant names to publish (empty = all selected by filter)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+defaults:
+  run:
+    shell: bash -Eeuo pipefail -x {0}
+
+jobs:
+  generate-jobs:
+    name: Generate Jobs
+    runs-on: ubuntu-latest
+    outputs:
+      strategy: ${{ steps.generate-jobs.outputs.strategy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker-library/bashbrew@HEAD
+      - id: generate-jobs
+        name: Generate Jobs
+        run: |
+          strategy="$("$BASHBREW_SCRIPTS/github-actions/generate.sh")"
+          echo "strategy=$strategy" >> "$GITHUB_OUTPUT"
+          jq . <<<"$strategy"
+
+  publish:
+    name: Publish ${{ matrix.name }}
+    needs: generate-jobs
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # reuse generated matrix, then filter in-step
+      matrix: ${{ fromJson(needs.generate-jobs.outputs.strategy).matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select publishable variants
+        id: select
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+          INPUT_VARIANTS: ${{ github.event.inputs.variants || '' }}
+        run: |
+          # ---- Selection logic ----
+          # Option A: manual input list from workflow_dispatch
+          if [[ -n "${INPUT_VARIANTS}" ]]; then
+            IFS=',' read -ra wanted <<<"${INPUT_VARIANTS}"
+            publish=false
+            for v in "${wanted[@]}"; do
+              v="$(xargs <<<"$v")"
+              if [[ "$v" == "$MATRIX_NAME" ]]; then
+                publish=true
+                break
+              fi
+            done
+            echo "publish=$publish" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Option B: automatic filter
+          # Example: publish only Debian-based variants and skip alpine
+          if [[ "$MATRIX_NAME" == *"alpine"* ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip non-selected variant
+        if: steps.select.outputs.publish != 'true'
+        run: echo "Skipping ${{ matrix.name }}"
+
+      - name: Prepare environment
+        if: steps.select.outputs.publish == 'true'
+        run: ${{ matrix.runs.prepare }}
+
+      - name: Pull dependencies
+        if: steps.select.outputs.publish == 'true'
+        run: ${{ matrix.runs.pull }}
+
+      - name: Build variant
+        if: steps.select.outputs.publish == 'true'
+        run: ${{ matrix.runs.build }}
+
+      - name: Login to GHCR
+        if: steps.select.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image names and tags
+        if: steps.select.outputs.publish == 'true'
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+          VARIANT: ${{ matrix.name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          owner_lc="$(tr '[:upper:]' '[:lower:]' <<<"$OWNER")"
+          # sanitize variant for image/package naming
+          variant_slug="$(tr '[:upper:]' '[:lower:]' <<<"$VARIANT" | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+|-+$//g')"
+
+          # separate package per variant:
+          # ghcr.io/<owner>/wordpress-<variant>
+          image="ghcr.io/${owner_lc}/wordpress-${variant_slug}"
+
+          tags=()
+          tags+=("${image}:sha-${SHA}")
+
+          # latest only on master
+          if [[ "$REF" == "refs/heads/master" ]]; then
+            tags+=("${image}:latest")
+          fi
+
+          # release tag (if pushing tag vX.Y.Z)
+          if [[ "$REF" == refs/tags/* ]]; then
+            ver="${REF#refs/tags/}"
+            tags+=("${image}:${ver}")
+          fi
+
+          {
+            echo "image=$image"
+            printf 'tags<<EOF\n'
+            printf '%s\n' "${tags[@]}"
+            printf 'EOF\n'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Retag local build and push
+        if: steps.select.outputs.publish == 'true'
+        env:
+          TARGET_IMAGE: ${{ steps.meta.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          MATRIX_NAME: ${{ matrix.name }}
+        run: |
+          # Assumption: matrix.runs.build leaves a local image tagged in a discoverable way.
+          # We pick the most recent local image as source; replace this with exact tag mapping if known.
+          src_image="$(docker images --format '{{.Repository}}:{{.Tag}}' | head -n1)"
+          test -n "$src_image"
+
+          while IFS= read -r t; do
+            [[ -z "$t" ]] && continue
+            docker tag "$src_image" "$t"
+            docker push "$t"
+          done <<<"$TAGS"
+
+      - name: Publish summary
+        if: steps.select.outputs.publish == 'true'
+        run: |
+          echo "Published variant: ${{ matrix.name }}"
+          echo "Package: ${{ steps.meta.outputs.image }}"
+          echo "Tags:"
+          echo "${{ steps.meta.outputs.tags }}"
