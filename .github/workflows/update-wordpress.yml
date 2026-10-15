@@ -1,0 +1,126 @@
+name: Update WordPress latest series
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      release_series:
+        description: 'WordPress stable release series (major.minor), for example 6.9 or 7.0'
+        required: false
+        default: '6.9'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+defaults:
+  run:
+    shell: 'bash -Eeuo pipefail -x {0}'
+
+jobs:
+  update-wordpress:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_SERIES: ${{ github.event.inputs.release_series || '6.9' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find latest stable release for configured series
+        id: detect
+        run: |
+          series="$RELEASE_SERIES"
+          if [[ ! "$series" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "error: release series must be 'major.minor' (received '$series')" >&2
+            exit 1
+          fi
+
+          version_regex="^${series//./\\.}\\.[0-9]+$"
+          candidate="$({
+            curl -fsSL 'https://api.wordpress.org/core/version-check/1.7/' \
+              | jq -r '.offers[].current // empty'
+          } | grep -E "$version_regex" | sort -V | tail -n1 || true)"
+
+          if [[ -z "$candidate" ]]; then
+            echo "error: no stable release found for series $series" >&2
+            exit 1
+          fi
+
+          current_version="$(jq -r '.latest.version' versions.json)"
+          current_upstream="$(jq -r '.latest.upstream' versions.json)"
+
+          newest_recorded="$current_version"
+          if [[ "$(printf '%s\n%s\n' "$current_version" "$current_upstream" | sort -V | tail -n1)" == "$current_upstream" ]]; then
+            newest_recorded="$current_upstream"
+          fi
+
+          if [[ "$candidate" == "$newest_recorded" ]] || [[ "$(printf '%s\n%s\n' "$candidate" "$newest_recorded" | sort -V | tail -n1)" != "$candidate" ]]; then
+            echo "No newer release found for $series (current: $newest_recorded, candidate: $candidate)."
+            echo "update_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "update_needed=true" >> "$GITHUB_OUTPUT"
+          echo "version=$candidate" >> "$GITHUB_OUTPUT"
+
+      - name: Stop when there is no newer release
+        if: steps.detect.outputs.update_needed != 'true'
+        run: echo "Already up-to-date; nothing to do."
+
+      - name: Download tarball and compute SHA-1
+        if: steps.detect.outputs.update_needed == 'true'
+        id: checksum
+        run: |
+          version='${{ steps.detect.outputs.version }}'
+          curl -o wordpress.tar.gz -fL "https://wordpress.org/wordpress-$version.tar.gz"
+          sha1="$(sha1sum wordpress.tar.gz | awk '{print $1}')"
+          rm -f wordpress.tar.gz
+          echo "sha1=$sha1" >> "$GITHUB_OUTPUT"
+
+      - name: Update versions.json and regenerate latest Dockerfiles
+        if: steps.detect.outputs.update_needed == 'true'
+        run: |
+          version='${{ steps.detect.outputs.version }}'
+          sha1='${{ steps.checksum.outputs.sha1 }}'
+
+          tmp_json="$(mktemp)"
+          jq --arg version "$version" --arg sha1 "$sha1" '
+            .latest.version = $version
+            | .latest.upstream = $version
+            | .latest.sha1 = $sha1
+          ' versions.json > "$tmp_json"
+          mv "$tmp_json" versions.json
+
+          ./apply-templates.sh latest
+
+          while IFS= read -r dockerfile; do
+            grep -F "version='$version';" "$dockerfile"
+            grep -F "sha1='$sha1';" "$dockerfile"
+          done < <(find latest -type f -name Dockerfile | sort)
+
+      - name: Commit changes and open pull request
+        if: steps.detect.outputs.update_needed == 'true'
+        run: |
+          version='${{ steps.detect.outputs.version }}'
+          branch="wp-update-${version}"
+
+          if [[ -n "$(git status --short versions.json latest)" ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+            git switch -c "$branch"
+            git add versions.json latest
+            git commit -m "Update WordPress to ${version}"
+            git push --set-upstream origin "$branch"
+
+            if [[ "$(gh pr list --head "$branch" --base master --state open --json number --jq 'length')" == '0' ]]; then
+              gh pr create \
+                --base master \
+                --head "$branch" \
+                --title "Update WordPress to ${version}" \
+                --body "Automated update of WordPress latest images to ${version}.\n\nThis updates versions.json and regenerates latest Dockerfiles via ./apply-templates.sh latest."
+            fi
+          else
+            echo "No file changes detected; nothing to commit."
+          fi
